@@ -3,6 +3,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -48,16 +49,32 @@ export function protectPrivateFile(target) {
 
 // All private JSON state uses the same temp-file, owner-only, atomic replace.
 // Keeping it here prevents one state writer from drifting away from the rest.
+//
+// Resolve the real file a path points at so an atomic replace updates a
+// symlink's target instead of replacing the symlink itself with a regular
+// file. `renameSync` over a symlink path silently substitutes the link, which
+// breaks user-managed setups where a config document points at dotfiles.
+export function resolveWriteTarget(target) {
+  try {
+    return realpathSync(target);
+  } catch {
+    // ENOENT: the path does not exist yet (first write) or the link is
+    // dangling. Keep the requested path; there is no symlink to preserve.
+    return target;
+  }
+}
+
 export function writePrivateFile(target, contents, { directoryMode } = {}) {
-  const directory = path.dirname(target);
+  const destination = resolveWriteTarget(target);
+  const directory = path.dirname(destination);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   if (directoryMode !== undefined) chmodSync(directory, directoryMode);
-  const temporary = `${target}.tmp.${process.pid}`;
+  const temporary = `${destination}.tmp.${process.pid}`;
   try {
     writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
     protectPrivateFile(temporary);
-    renameSync(temporary, target);
-    protectPrivateFile(target);
+    renameSync(temporary, destination);
+    protectPrivateFile(destination);
   } catch (error) {
     if (existsSync(temporary)) unlinkSync(temporary);
     throw error;

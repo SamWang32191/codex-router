@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   rmSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -1332,5 +1336,50 @@ accent = "#4e96d1"
     );
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("config manager writes through a symlinked config.toml instead of replacing it", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-symlink-"));
+  const targetDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-target-"));
+  const targetPath = path.join(targetDir, "config.toml");
+  const original = `model = "gpt-5.6-sol"
+model_provider = "openai"
+
+[profiles.work]
+model = "gpt-5.6-terra"
+approval_policy = "never"
+`;
+  writeFileSync(targetPath, original, { mode: 0o644 });
+  const configPath = path.join(codexHome, "config.toml");
+  symlinkSync(targetPath, configPath);
+
+  try {
+    const enabled = run("enable", codexHome);
+    assert.equal(enabled.mode, "router");
+    assert.equal(enabled.config_protected, true);
+
+    // The link itself must survive the write, still pointing at the target.
+    assert.ok(lstatSync(configPath).isSymbolicLink(), "config.toml is still a symlink");
+    assert.equal(path.resolve(readlinkSync(configPath)), targetPath);
+    assert.equal(
+      readFileSync(targetPath, "utf8").split("\n")[0],
+      'model = "gpt-5.6-sol"',
+    );
+    // The managed block must land in the symlink target, not in a new file.
+    const configured = readFileSync(targetPath, "utf8");
+    assert.match(configured, /# BEGIN codex-router-managed/);
+    assert.match(configured, /# BEGIN codex-router-provider-managed/);
+    assert.match(configured, /\[model_providers\.codex-router\]/);
+    // Codex still reads the config through the link.
+    assert.equal(readFileSync(configPath, "utf8"), configured);
+    assert.equal(
+      (statSync(targetPath).mode & 0o777).toString(8),
+      "600",
+      "the symlink target is protected",
+    );
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(targetDir, { recursive: true, force: true });
   }
 });

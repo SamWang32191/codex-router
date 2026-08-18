@@ -25,6 +25,7 @@ import {
 import {
   privateFileIsProtected,
   protectPrivateFile,
+  resolveWriteTarget,
 } from "./file-security.mjs";
 import {
   activateNativeCatalogSource,
@@ -1087,13 +1088,16 @@ function restoreNativeCatalog(contents) {
 }
 
 function atomicWrite(contents) {
-  mkdirSync(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${CONFIG_PATH}.tmp.${process.pid}`;
+  const destination = resolveWriteTarget(CONFIG_PATH);
+  // The temporary file must live beside the destination so rename stays on
+  // one filesystem; for a symlinked config that means beside the target.
+  mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  const temporary = `${destination}.tmp.${process.pid}`;
   writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
   try {
     protectPrivateFile(temporary);
-    renameSync(temporary, CONFIG_PATH);
-    protectPrivateFile(CONFIG_PATH);
+    renameSync(temporary, destination);
+    protectPrivateFile(destination);
   } catch (error) {
     if (existsSync(temporary)) unlinkSync(temporary);
     throw error;

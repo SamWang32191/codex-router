@@ -15,6 +15,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveWriteTarget } from "./file-security.mjs";
 import { assertCallerSecret, callerBaseUrl, redactCallerUrl } from "./caller-auth.mjs";
 import {
   DSH_CATALOG_PATH,
@@ -58,13 +59,14 @@ function readDocument(target) {
 // authentication capability, and the credentials document carries the key it
 // references.
 function writeDocument(target, contents) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.tmp.${process.pid}`;
+  const destination = resolveWriteTarget(target);
+  mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  const temporary = `${destination}.tmp.${process.pid}`;
   writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
   try {
     protectPrivateFile(temporary);
-    renameSync(temporary, target);
-    protectPrivateFile(target);
+    renameSync(temporary, destination);
+    protectPrivateFile(destination);
   } catch (error) {
     if (existsSync(temporary)) unlinkSync(temporary);
     throw error;
