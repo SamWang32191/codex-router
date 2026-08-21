@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Grok 4.6 can select Codex's native image viewer.** xAI stopped without a
+  function call when the tool was named `view_image`, even when selection was
+  required. The Grok OAuth boundary now presents that tool as `inspect_image`
+  and restores returned calls to `view_image`, without colliding with a real
+  client tool of the same alias name. This complements the existing
+  image-result transport fix: Grok can now both invoke the viewer and receive
+  its returned pixels.
+
+- **Grok OAuth keeps image-bearing tool results multimodal.** The
+  Chat Completions-to-Responses hop JSON-stringified every non-string tool
+  result, so Codex could complete `view_image` while Grok received JSON and
+  base64 text instead of pixels. Structured image output now remains
+  `input_image`, preserves detail and mixed-part order, and recovers common
+  image MIME types from generic octet-stream data URLs. Text-only and other
+  structured tool results keep their previous behavior.
+
 - **A Codex Stop hook continues grok-oauth mid-task stops once.** After a
   tool result, a short status sentence with no follow-up tool call used to
   hand control back. `hooks/codex-stop-grok-oauth.mjs` is a user-level Stop

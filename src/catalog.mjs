@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
 import { isManagedCallerBaseUrl } from "./caller-auth.mjs";
+import { applyInstructionOverlay } from "./instruction-overlays.mjs";
 import {
   ANNOUNCED_MODELS_PATH,
   CONFIG_PATH,
@@ -46,6 +47,7 @@ import {
   readNativeCatalogSource,
 } from "./native-catalog-source.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
+import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
 
@@ -471,10 +473,10 @@ function rewriteIdentity(text, model) {
   const name = identityName(model);
   return text
     .replace(
-      /\b(?:a coding agent|an agent) based on GPT-5\b/g,
+      /\b(?:a coding agent|an agent) based on GPT-5(?:\.\d+)?(?:[-\s](?:Sol|Terra|Luna))?\b/gi,
       `a coding agent based on ${name}`,
     )
-    .replace(/\bbased on GPT-5\b/g, `based on ${name}`);
+    .replace(/\bbased on GPT-5(?:\.\d+)?(?:[-\s](?:Sol|Terra|Luna))?\b/gi, `based on ${name}`);
 }
 
 function rewriteModelMessages(messages, model) {
@@ -488,9 +490,18 @@ function rewriteModelMessages(messages, model) {
   return next;
 }
 
+const NATIVE_PARALLEL_TOOL_CALL_COMPAT = new Map([["gpt-5.2", true]]);
+
 function normalizeNativeModel(model) {
+  const supportsParallelToolCalls =
+    typeof model.supports_parallel_tool_calls === "boolean"
+      ? model.supports_parallel_tool_calls
+      : NATIVE_PARALLEL_TOOL_CALL_COMPAT.get(String(model.slug));
   return {
     ...model,
+    ...(typeof supportsParallelToolCalls === "boolean"
+      ? { supports_parallel_tool_calls: supportsParallelToolCalls }
+      : {}),
     supports_reasoning_summaries:
       typeof model.supports_reasoning_summaries === "boolean"
         ? model.supports_reasoning_summaries
@@ -498,9 +509,26 @@ function normalizeNativeModel(model) {
   };
 }
 
-export function routedModel(template, model) {
+export function routedModel(template, model, behaviorTemplate = template) {
+  const behaviorModelMessages =
+    behaviorTemplate?.model_messages &&
+    typeof behaviorTemplate.model_messages === "object" &&
+    !Array.isArray(behaviorTemplate.model_messages)
+      ? behaviorTemplate.model_messages
+      : template.model_messages;
+  const derivedBehaviorInstructions = deriveBaseInstructions(behaviorModelMessages);
+  const behaviorInstructions =
+    typeof behaviorTemplate?.base_instructions === "string" &&
+    behaviorTemplate.base_instructions.trim()
+      ? behaviorTemplate.base_instructions
+      : typeof derivedBehaviorInstructions === "string" &&
+          derivedBehaviorInstructions.trim()
+        ? derivedBehaviorInstructions
+        : template.base_instructions;
   const next = {
     ...template,
+    base_instructions: behaviorInstructions,
+    model_messages: behaviorModelMessages,
     slug: model.slug,
     display_name: model.displayName,
     description: model.description,
@@ -572,6 +600,10 @@ export function routedModel(template, model) {
     // opt in after their tool and encrypted-payload relay paths are verified.
     multi_agent_version: model.multiAgentVersion || "v1",
   };
+  // Native GPT-5.6 templates may carry this transport/tool-mode switch. It is
+  // not a routed capability and must stay out even when that native entry is
+  // also the conservative fallback template.
+  delete next.tool_mode;
   // ClinePass strips these unsupported request controls, so Codex must not offer them.
   if (model.requestProfile === "clinepass") {
     delete next.default_reasoning_level;
@@ -587,10 +619,19 @@ export function routedModel(template, model) {
     next.experimental_supported_tools = [...model.experimentalSupportedTools];
   }
   if (typeof next.base_instructions === "string") {
-    next.base_instructions = rewriteIdentity(next.base_instructions, model);
+    next.base_instructions = applyInstructionOverlay(
+      rewriteIdentity(next.base_instructions, model),
+      model.instructionOverlay,
+    );
   }
   if (next.model_messages) {
     next.model_messages = rewriteModelMessages(next.model_messages, model);
+    if (typeof next.model_messages?.instructions_template === "string") {
+      next.model_messages.instructions_template = applyInstructionOverlay(
+        next.model_messages.instructions_template,
+        model.instructionOverlay,
+      );
+    }
   }
   return next;
 }
@@ -701,6 +742,12 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
   const disabled = new Set(settings.disabled || []);
   return models.map((model) => {
     const slug = String(model.slug);
+    // Extended-context aliases are manual parent-model choices, not distinct
+    // child-agent backends. Keep them out of spawn_agent model overrides so
+    // delegated work uses the base model's default context window.
+    if (NATIVE_CONTEXT_VARIANT_SLUGS.includes(slug)) {
+      return { ...model, multi_agent_version: "v1" };
+    }
     if (model.visibility !== "list") return model;
     if (hidden.has(slug) || disabled.has(slug)) return model;
     if (NATIVE_V2_BACKEND_SLUGS.has(slug)) {
@@ -711,6 +758,11 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
     }
     return model;
   });
+}
+
+function behaviorTemplateFor(nativeModels, model, fallback) {
+  if (!model.behaviorTemplate) return fallback;
+  return nativeModels.find((candidate) => candidate.slug === model.behaviorTemplate) || fallback;
 }
 
 export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
@@ -727,7 +779,8 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
       : [],
   );
   for (const model of routedModelsList) {
-    models.set(model.slug, routedModel(template, model));
+    const behaviorTemplate = behaviorTemplateFor(native.models, model, template);
+    models.set(model.slug, routedModel(template, model, behaviorTemplate));
   }
   return sortCatalogModels(models.values());
 }
@@ -755,7 +808,11 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
   );
   const models = [
     ...assignments.map(({ nativeModel, model }) => ({
-      ...routedModel(nativeModel, model),
+      ...routedModel(
+        nativeModel,
+        model,
+        behaviorTemplateFor(native.models, model, nativeModel),
+      ),
       slug: nativeModel.slug,
       priority: nativeModel.priority,
     })),
@@ -803,10 +860,9 @@ function main() {
   const loginFree = loginFreeConfigured();
   const native = {
     ...captured,
-    // Variants join before the multi-agent pass so a switched-off one is
-    // demoted exactly like every other hidden model, and a switched-on one
-    // inherits its base model's verified backend version rather than a
-    // separate claim about the same upstream.
+    // Variants join before the multi-agent pass so the extended-context alias
+    // can remain manually selectable while being forced parent-only; delegated
+    // work must use the base model's default context window.
     models: promoteNativeMultiAgent(
       withNativeContextVariants(captured.models, { enabled: !loginFree }),
       multiAgentSettings,
@@ -930,7 +986,10 @@ function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    main();
+    // The lock begins before the first ownership or mutable-state read and is
+    // released only after probes and the coupled catalog-file transaction are
+    // complete. Every app/CLI/autonomous caller executes this same entrypoint.
+    await withCatalogPublicationLock(main);
   } catch (error) {
     // Ownership conflicts are an operator mistake with a specific remedy, so
     // print the guidance rather than a stack trace.
