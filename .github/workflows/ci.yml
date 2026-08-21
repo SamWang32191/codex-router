@@ -168,7 +168,12 @@ jobs:
             artifact_path: apps/control-center/release/codex-router-control-center-linux.tar.gz
           - platform: macOS
             os: macos-latest
-            builder_flag: --mac --arm64 --x64
+            # electron-fuses rewrites the upstream-signed Mach-O. Skipping
+            # signing afterwards leaves a signature macOS rejects before the
+            # app can start, so beta artifacts need an explicit ad-hoc
+            # signature. Hardened runtime is incompatible with that identity
+            # unless library validation is disabled.
+            builder_flag: --mac --arm64 --x64 -c.mac.identity=- -c.mac.hardenedRuntime=false
             artifact_path: |
               apps/control-center/release/*.dmg
               apps/control-center/release/*.zip
@@ -178,8 +183,10 @@ jobs:
             artifact_path: apps/control-center/release/*.exe
     runs-on: ${{ matrix.os }}
     env:
-      # Pull-request artifacts are deliberately unsigned. Production releases
-      # must use the platform signing and notarization credentials instead.
+      # Pull-request artifacts never use production signing credentials. The
+      # macOS matrix entry requests only an ad-hoc signature so its rewritten
+      # Electron executable remains runnable; production releases must use the
+      # platform signing and notarization credentials instead.
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     defaults:
       run:
@@ -306,7 +313,7 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: apps/control-center/release
         run: tar -czf codex-router-control-center-linux.tar.gz -- *.AppImage
-      - name: Publish the unsigned beta package
+      - name: Publish the beta package
         uses: actions/upload-artifact@v7
         with:
           name: codex-router-control-center-${{ matrix.platform }}-${{ github.sha }}

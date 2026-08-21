@@ -95,11 +95,13 @@ npm run electron:build
 ```
 
 `electron:build` creates the current host platform's artifacts in `release/`:
-DMG/ZIP on macOS, NSIS on Windows, and AppImage on Linux. Beta CI artifacts are
-unsigned unless signing credentials are explicitly configured. macOS public
-distribution additionally requires Developer ID signing and notarization;
-Windows public distribution needs an Authenticode certificate. Treat unsigned
-artifacts as tester builds, not production installers.
+DMG/ZIP on macOS, NSIS on Windows, and AppImage on Linux. Beta CI artifacts do
+not use production signing credentials. The macOS beta is ad-hoc signed after
+Electron fuses are applied so the rewritten executable remains locally
+runnable, but it is not Developer ID signed or notarized. macOS public
+distribution requires Developer ID signing and notarization; Windows public
+distribution needs an Authenticode certificate. Treat beta artifacts as tester
+builds, not production installers.
 
 ## Security boundary
 
