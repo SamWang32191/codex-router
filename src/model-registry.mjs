@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
-import { readUserModels } from "./user-models.mjs";
+import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -20,6 +20,7 @@ function fail(message) {
 // credential-free exfiltration path.
 const ANONYMOUS_ENDPOINTS = Object.freeze({
   "opencode-free": "https://opencode.ai/zen/v1",
+  "opencode-free-responses": "https://opencode.ai/zen/v1",
   "kilo-free": "https://api.kilo.ai/api/gateway",
 });
 
@@ -41,6 +42,9 @@ export function anonymousModelAllowed(provider, modelId) {
     return id === "big-pickle" || id.endsWith("-free");
   }
   if (provider.anonymousModelPolicy === "suffix-free") return id.endsWith(":free");
+  if (provider.anonymousModelPolicy === "explicit-models") {
+    return Array.isArray(provider.anonymousModels) && provider.anonymousModels.includes(id);
+  }
   return false;
 }
 
@@ -260,15 +264,36 @@ function loadRegistry() {
         if (provider.keyless || provider.credential !== undefined) {
           fail(`anonymous provider ${provider.id} must not declare keyless or credential metadata`);
         }
-        if (
-          !["opencode-console", "suffix-free"].includes(provider.anonymousModelPolicy)
-        ) {
+        if (![
+          "explicit-models",
+          "opencode-console",
+          "suffix-free",
+        ].includes(provider.anonymousModelPolicy)) {
           fail(`anonymous provider ${provider.id} requires a supported anonymousModelPolicy`);
+        }
+        if (provider.anonymousModelPolicy === "explicit-models") {
+          const models = provider.anonymousModels;
+          if (
+            !Array.isArray(models) ||
+            models.length === 0 ||
+            models.some((model) =>
+              typeof model !== "string" || !model.trim() || model !== model.trim()
+            ) ||
+            new Set(models).size !== models.length
+          ) {
+            fail(`anonymous provider ${provider.id} requires a valid anonymousModels allowlist`);
+          }
+        } else if (provider.anonymousModels !== undefined) {
+          fail(`anonymous provider ${provider.id} may declare anonymousModels only with explicit-models policy`);
         }
         if (typeof provider.anonymousNote !== "string" || !provider.anonymousNote.trim()) {
           fail(`anonymous provider ${provider.id} requires an anonymousNote`);
         }
-      } else if (provider.anonymousModelPolicy !== undefined || provider.anonymousNote !== undefined) {
+      } else if (
+        provider.anonymousModelPolicy !== undefined ||
+        provider.anonymousModels !== undefined ||
+        provider.anonymousNote !== undefined
+      ) {
         fail(`provider ${provider.id} has anonymous metadata without authMode anonymous`);
       }
       if (
@@ -449,12 +474,16 @@ function endpointProblem(model, provider) {
 // has to be provider-shaped so the existing base-URL and credential chains
 // accept it. Identity is derived here rather than read from the fragment.
 function normalizedModel(model, provider) {
-  if (!provider?.perModelEndpoint) return Object.freeze(model);
+  const officialDisplayName = officialModelDisplayName(model.provider, model.upstreamModel);
+  const presented = officialDisplayName && model.displayName !== officialDisplayName
+    ? { ...model, displayName: officialDisplayName }
+    : model;
+  if (!provider?.perModelEndpoint) return Object.freeze(presented);
   return Object.freeze({
-    ...model,
+    ...presented,
     endpoint: Object.freeze({
-      ...model.endpoint,
-      id: model.slug,
+      ...presented.endpoint,
+      id: presented.slug,
       kind: "openai-compatible",
     }),
   });
@@ -547,6 +576,9 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   // never needs it, so only false is accepted.
   if (model.visionBridge !== undefined && model.visionBridge !== false) {
     return `model ${model.slug} may only set visionBridge to false`;
+  }
+  if (model.isFree !== undefined && typeof model.isFree !== "boolean") {
+    return `model ${model.slug} has an invalid isFree flag`;
   }
   // "hosted" means the provider's own backend executes web searches
   // server-side (xAI's Responses proxy today). "standalone" means Codex
@@ -685,6 +717,17 @@ function mergeUserModels(base) {
   const gatewayModels = new Set(models.map((model) => model.gatewayModel));
   const userModels = new Set();
   for (const model of readUserModels()) {
+    // A mutable local overlay may describe routing and presentation, but it
+    // cannot grant itself the repository's native-collaboration certificate.
+    // Local Ollama/LM Studio entries intentionally declare conservative v1 so
+    // they are settled and never spend a cloud compatibility probe. Preserve
+    // that denial, but refuse the positive certificate.
+    if (model?.multiAgentVersion === "v2") {
+      warnings.push(
+        `Skipped user model: model ${model?.slug || "<unknown>"} may not declare multiAgentVersion v2`,
+      );
+      continue;
+    }
     const problem = modelProblem(model, base.providers, slugs, gatewayModels);
     if (problem) {
       warnings.push(`Skipped user model: ${problem}`);
@@ -715,6 +758,11 @@ const registry = loadRegistry();
 const merged = mergeUserModels(registry);
 
 export const PROVIDERS = registry.providers;
+// The immutable registry shipped by this checkout, before the operator's
+// mutable user-model overlay is merged. Repository certification gates must
+// bind to this set: a local overlay is useful routing configuration, but it
+// cannot certify itself for every installer.
+export const CHECKED_IN_MODELS = registry.models;
 export const MODELS = merged.models;
 export const USER_MODEL_WARNINGS = merged.warnings;
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));

@@ -252,6 +252,7 @@ enum RouterChineseText {
     "Subagent choices do not hide models from Codex's picker — use Model picker below for that.": "子代理选择不会隐藏 Codex 选择器中的模型；如需隐藏模型，请使用下面的模型选择器。",
     "Hidden models stay connected but are not offered by Codex.": "隐藏的模型仍保持连接，但不会提供给 Codex。",
     "Run models locally through Ollama. Enable an installed model to make it available to Codex.": "通过 Ollama 在本地运行模型。启用已安装的模型即可提供给 Codex。",
+    "Run local models through Ollama or the curated MLX runtime. Installed models are wired into the same Codex proxy.": "通过 Ollama 或精选的 MLX 运行时在本地运行模型。已安装的模型会接入同一个 Codex 代理。",
     "Nothing installed yet. Start with a quick pick or browse the Ollama catalog below.": "尚未安装模型。请选择快速选项，或浏览下面的 Ollama 目录。",
     "Install a model": "安装模型",
     "Install": "安装",
@@ -451,6 +452,8 @@ enum RouterChineseText {
     "5-hour limit": "5 小时限制",
     "Hidden from picker — show it below to use it here": "已从选择器隐藏 — 请在下方显示后才能使用",
     "Proven v2": "已验证 v2",
+    "v1 only": "仅支持 v1",
+    "Certification candidate": "认证候选",
     "Not selected": "未选择",
     "Apply the checked-out router revision, then run the Codex doctor": "应用已检出的路由版本，然后运行 Codex doctor",
     "Run the Codex doctor and repair managed router files": "运行 Codex doctor 并修复受管理的路由文件",
@@ -488,5 +491,49 @@ enum RouterChineseText {
     "Codex Router · %@ (%@) · %@": "Codex Router · %@ (%@) · %@",
     "Codex Router · %@ (%@)": "Codex Router · %@ (%@)",
     "Select": "选择",
+    // Service health panel. The state words are shared with the Control
+    // Center's panel, so they are translated as the same vocabulary: a row is
+    // Ready/Standby/Degraded/Offline and its detail says why.
+    "Service health": "服务健康",
+    "Checking": "检查中",
+    "All clear": "一切正常",
+    "Serving locally": "正在本地提供服务",
+    "Degraded": "降级",
+    "Offline": "离线",
+    "Health endpoint unavailable": "健康检查端点不可用",
+    "Unknown": "未知",
+    "Waiting for health report": "等待健康报告",
+    "Standby": "待命",
+    "Not enabled": "未启用",
+    "Unreachable": "无法连接",
+    "Reachable": "可连接",
+    "External forwarders": "外部转发器",
+    // Composed as "\(effort) \(thinking)", so this follows the effort word.
+    // "思考强度" is the vocabulary already used for effort elsewhere here.
+    "Subagent": "子代理",
+    "thinking": "思考强度",
+
+    // Provider catalogs: the on-demand panel that asks a configured
+    // provider for its current model list and curates from it.
+    "Provider catalogs": "服务商模型目录",
+    "Load the latest provider models": "加载服务商的最新模型",
+    "Connect a supported provider to load its latest models.": "先连接受支持的服务商，才能加载其最新模型。",
+    "Load models asks that provider for its current list. Choosing models adds them to the router and republishes every installed client.": "“加载模型”会向该服务商索取当前列表。选择模型后会将其加入路由，并重新发布所有已安装的客户端。",
+    "Reload provider models": "重新加载服务商模型",
+    "Reloading provider models…": "正在重新加载服务商模型…",
+    "Fetch the current catalog from every connected provider that supports live model discovery.": "从每个支持实时模型发现的已连接服务商获取当前目录。",
+    "Refresh models": "刷新模型",
+    "Reload installed and available local models from the router.": "从路由重新加载已安装和可用的本地模型。",
+    "Loading models": "正在加载模型",
+    "Search available models": "搜索可用模型",
+    "No provider models match this search.": "没有服务商模型匹配此搜索。",
+    "Added": "已添加",
+    "Showing the first 80 matches. Search to narrow the list.": "仅显示前 80 条匹配结果。请搜索以缩小范围。",
+    "%d selected": "已选择 %d 个",
+    "Add selected": "添加所选",
+    "Load the current list from this provider.": "从该服务商加载当前列表。",
+    "saved list": "已保存列表",
+    "live list": "实时列表",
+    "%d models · %d added · %@": "%d 个模型 · 已添加 %d 个 · %@",
   ]
 }

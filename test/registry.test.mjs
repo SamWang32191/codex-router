@@ -83,6 +83,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b",
       "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-flash-vision-exp",
       "deepseek/deepseek-v4-pro",
       "grok-api/grok-4.5",
       "grok-oauth/grok-4.5",
@@ -120,6 +121,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-messages/qwen3.7-plus",
       "opencode-go-messages/qwen3.8-max",
       "opencode-go-responses/gpt-5.6-luna",
+      "opencode-go-responses/muse-spark-1.2-contributor",
       "qwen-plan/deepseek-v4-flash-0731",
       "qwen-plan/deepseek-v4-pro-0813",
       "qwen-plan/deepseek-v4-pro",
@@ -181,8 +183,15 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(PROVIDERS.get("opencode-go").baseUrl, "https://opencode.ai/zen/go/v1");
   assert.equal(PROVIDERS.get("opencode-go-messages").baseUrl, "https://opencode.ai/zen/go/v1");
   assert.equal(PROVIDERS.get("opencode-go-responses").baseUrl, "https://opencode.ai/zen/go/v1");
+  assert.equal(PROVIDERS.get("opencode-zen").baseUrl, "https://opencode.ai/zen/v1");
+  assert.equal(PROVIDERS.get("opencode-zen").baseUrlEnv, "OPENCODE_ZEN_BASE_URL");
+  assert.equal(PROVIDERS.get("opencode-zen").protocol, undefined);
   assert.equal(PROVIDERS.get("opencode-go-messages").protocol, "anthropic");
   assert.equal(PROVIDERS.get("opencode-go-responses").protocol, "openai-responses");
+  const goMuse = MODEL_BY_SLUG.get("opencode-go-responses/muse-spark-1.2-contributor");
+  assert.equal(goMuse.provider, "opencode-go-responses");
+  assert.equal(goMuse.upstreamModel, "muse-spark-1.2-contributor");
+  assert.equal(goMuse.gatewayModel, "opencode-go-responses-muse-spark-1-2-contributor");
   assert.equal(PROVIDERS.get("commandcode").baseUrl, "https://api.commandcode.ai/provider/v1");
   assert.equal(PROVIDERS.get("commandcode-messages").baseUrl, "https://api.commandcode.ai/provider/v1");
   assert.equal(PROVIDERS.get("commandcode-messages").protocol, "anthropic");
@@ -197,6 +206,8 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(PROVIDERS.get("opencode-go").variantOf, undefined);
   assert.equal(PROVIDERS.get("opencode-go-messages").variantOf, "opencode-go");
   assert.equal(PROVIDERS.get("opencode-go-responses").variantOf, "opencode-go");
+  assert.equal(PROVIDERS.get("opencode-zen").variantOf, "opencode-go");
+  assert.equal(PROVIDERS.has("opencode-zen-responses"), false);
   assert.equal(PROVIDERS.get("commandcode").variantOf, undefined);
   assert.equal(PROVIDERS.get("commandcode-messages").variantOf, "commandcode");
   assert.equal(
@@ -259,10 +270,40 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(chutes.credential.file, "chutes-api-key.secret");
   assert.deepEqual(chutes.credential.keychainServices, ["codex-router-chutes"]);
   assert.equal(LISTED_MODELS.some(({ provider }) => provider === "chutes"), false);
+  const nanoGpt = PROVIDERS.get("nano-gpt");
+  assert.equal(nanoGpt.baseUrl, "https://nano-gpt.com/api/v1");
+  assert.equal(nanoGpt.baseUrlEnv, "NANOGPT_API_BASE_URL");
+  assert.deepEqual(nanoGpt.credential.environment, ["NANOGPT_API_KEY"]);
+  assert.equal(nanoGpt.credential.file, "nano-gpt-api-key.secret");
+  assert.deepEqual(nanoGpt.credential.keychainServices, ["codex-router-nano-gpt"]);
+  assert.equal(LISTED_MODELS.some(({ provider }) => provider === "nano-gpt"), false);
+  const venice = PROVIDERS.get("venice");
+  assert.equal(venice.baseUrl, "https://api.venice.ai/api/v1");
+  assert.equal(venice.baseUrlEnv, "VENICE_API_BASE_URL");
+  assert.deepEqual(venice.credential.environment, ["VENICE_API_KEY"]);
+  assert.equal(venice.credential.file, "venice-api-key.secret");
+  assert.deepEqual(venice.credential.keychainServices, ["codex-router-venice"]);
+  assert.equal(LISTED_MODELS.some(({ provider }) => provider === "venice"), false);
   const opencodeFree = PROVIDERS.get("opencode-free");
+  const opencodeFreeResponses = PROVIDERS.get("opencode-free-responses");
   assert.equal(opencodeFree.authMode, "anonymous");
   assert.equal(opencodeFree.baseUrl, "https://opencode.ai/zen/v1");
   assert.equal(opencodeFree.credential, undefined);
+  assert.equal(opencodeFreeResponses.variantOf, "opencode-free");
+  assert.equal(opencodeFreeResponses.protocol, "openai-responses");
+  assert.equal(opencodeFreeResponses.authMode, "anonymous");
+  assert.equal(opencodeFreeResponses.baseUrl, "https://opencode.ai/zen/v1");
+  assert.equal(opencodeFreeResponses.baseUrlEnv, undefined);
+  assert.equal(opencodeFreeResponses.credential, undefined);
+  assert.equal(opencodeFreeResponses.anonymousModelPolicy, "explicit-models");
+  assert.deepEqual(opencodeFreeResponses.anonymousModels, [
+    "muse-spark-1.2-contributor-free",
+  ]);
+  assert.equal(anonymousModelAllowed(opencodeFreeResponses, "muse-spark-1.2-contributor-free"), true);
+  assert.equal(anonymousModelAllowed(opencodeFreeResponses, "x-preview-f-free"), false);
+  assert.equal(anonymousModelAllowed(opencodeFreeResponses, "big-pickle"), false);
+  assert.equal(anonymousModelAllowed(opencodeFreeResponses, "arbitrary-free"), false);
+  assert.equal(anonymousModelAllowed(opencodeFreeResponses, "muse-spark-1.2"), false);
   assert.equal(anonymousModelAllowed(opencodeFree, "big-pickle"), true);
   assert.equal(anonymousModelAllowed(opencodeFree, "mimo-v2.5-free"), true);
   assert.equal(anonymousModelAllowed(opencodeFree, "glm-5.1"), false);
@@ -418,6 +459,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   }
   const standaloneSearchSlugs = new Set([
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
     "xiaomi-mimo/mimo-v2.5",
     "zai-coding/glm-5.3",
@@ -434,6 +476,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   ).map((model) => model.slug);
   assert.deepEqual(originalDetailSlugs.sort(), [
     "anthropic-api/claude-opus-4.8",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "grok-api/grok-4.5",
     "grok-oauth/grok-4.5",
     "grok-oauth/grok-4.6",
@@ -501,6 +544,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "grok-oauth/grok-4.5",
     "grok-api/grok-4.5",
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-reasoner",
   ]) {
@@ -509,13 +553,26 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-chat").supportsReasoningSummaries, undefined);
   for (const slug of [
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-pro",
   ]) {
     const model = MODEL_BY_SLUG.get(slug);
     assert.equal(model.contextWindow, 1_048_576);
+    assert.equal(model.autoCompact, 900_000);
     assert.match(model.description, /DeepSeek V4/);
-    assert.deepEqual(model.inputModalities, ["text"]);
   }
+  assert.deepEqual(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash").inputModalities,
+    ["text"],
+  );
+  assert.deepEqual(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-pro").inputModalities,
+    ["text"],
+  );
+  assert.deepEqual(
+    MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash-vision-exp").inputModalities,
+    ["text", "image"],
+  );
 });
 
 test("only checked-in Gemini reseller models opt into trailing model-turn trimming", () => {
@@ -533,10 +590,52 @@ test("only checked-in Gemini reseller models opt into trailing model-turn trimmi
 test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   for (const slug of [
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-vision-exp",
     "opencode-go/deepseek-v4-flash",
   ]) {
     assert.deepEqual(MODEL_BY_SLUG.get(slug)?.searchTool, { mode: "standalone" }, slug);
   }
+});
+
+test("DeepSeek V4 Flash Vision Exp advertises only verified direct-API capabilities", () => {
+  const model = MODEL_BY_SLUG.get("deepseek/deepseek-v4-flash-vision-exp");
+  assert.ok(model);
+  assert.equal(model.provider, "deepseek");
+  assert.equal(model.gatewayModel, "deepseek-v4-flash-vision-exp");
+  assert.equal(model.upstreamModel, "deepseek-v4-flash-vision-exp");
+  assert.equal(model.listed, true);
+  assert.equal(model.requestProfile, "deepseek-thinking");
+  assert.equal(model.defaultEffort, "high");
+  assert.deepEqual(
+    model.reasoningLevels.map((level) => level.effort),
+    ["low", "high", "max"],
+  );
+  assert.equal(model.contextWindow, 1_048_576);
+  assert.equal(model.autoCompact, 900_000);
+  assert.deepEqual(model.inputModalities, ["text", "image"]);
+  assert.equal(model.supportsImageDetailOriginal, true);
+  assert.deepEqual(model.searchTool, { mode: "standalone" });
+  assert.equal(model.supportsReasoningSummaries, true);
+  assert.equal(endpointForModel(model), PROVIDERS.get("deepseek"));
+  assert.ok(API_MODELS.includes(model));
+});
+
+test("GLM-5.3 on OpenCode Go carries the 1M GLM-5.3 window, not GLM-5.1's 200K", () => {
+  const model = MODEL_BY_SLUG.get("opencode-go/glm-5.3");
+  assert.equal(model?.contextWindow, 1_000_000);
+  assert.equal(model?.autoCompact, 900_000);
+  // The sibling GLM entries on this same gateway already serve 1,048,576, so
+  // the gateway does not clamp the family; 1M stays conservative against them.
+  for (const sibling of ["opencode-go/glm-5.1", "opencode-go/glm-5.2"]) {
+    assert.ok(
+      MODEL_BY_SLUG.get(sibling)?.contextWindow >= model.contextWindow,
+      `${sibling} should not serve less than glm-5.3`,
+    );
+  }
+  // Standalone search stays off: docs/HOW-IT-WORKS.md requires per-route
+  // verification that the upstream preserves tool/function-call history, and
+  // no probe of the opencode Go relay has been recorded.
+  assert.equal(model?.searchTool, undefined);
 });
 
 test("GLM-5.3 Coding Plan opts in to GPT-5.6 behavior, concise execution, and standalone search", () => {
@@ -649,6 +748,19 @@ test("the gateway config disables deployment cooldowns", () => {
   assert.equal(new Set(names).size, names.length, "one deployment per model_name");
 });
 
+test("only Z.ai Coding Plan model groups disable LiteLLM rate-limit retries", () => {
+  const rendered = renderLiteLlmConfig();
+  for (const model of MODELS.filter(({ provider }) => provider === "zai-coding")) {
+    assert.match(
+      rendered,
+      new RegExp(`${model.gatewayModel}:\\n\\s+RateLimitErrorRetries: 0`),
+      model.slug,
+    );
+  }
+  assert.doesNotMatch(rendered, /^  retry_policy:/m);
+  assert.doesNotMatch(rendered, /zai-api-glm-5-3:\n\s+RateLimitErrorRetries: 0/);
+});
+
 test("LiteLLM configuration is generated from every registry route", () => {
   const rendered = renderLiteLlmConfig();
   for (const model of MODELS) {
@@ -662,6 +774,10 @@ test("LiteLLM configuration is generated from every registry route", () => {
   assert.match(
     rendered,
     /model: "openai\/responses\/opencode-go-responses-gpt-5-6-luna"/,
+  );
+  assert.match(
+    rendered,
+    /model: "openai\/responses\/opencode-go-responses-muse-spark-1-2-contributor"/,
   );
   assert.equal(
     MODELS.some((model) => model.provider === "github-copilot"),
@@ -851,6 +967,31 @@ test("serviceTiers require unique non-empty ids and names", async () => {
   }
 });
 
+test("isFree is a boolean model tag", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const nodePath = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(nodePath.join(tmpdir(), "registry-free-tag-test-"));
+  const load = (isFree) => {
+    const registry = readRegistryDocument("config");
+    registry.models = [{ ...registry.models[0], isFree }, ...registry.models.slice(1)];
+    const registryPath = nodePath.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    return spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+  };
+  try {
+    assert.match(load("yes").stderr, /invalid isFree flag/);
+    assert.equal(load(true).status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // A keyless provider skips the credential requirement, which is only safe
 // because it cannot reach off-box. Both halves of that bargain are enforced.
 test("a keyless provider must be loopback and must not carry a credential", async () => {
@@ -922,6 +1063,60 @@ test("credential-free endpoints are allowlisted addresses, at the provider and a
     });
     assert.equal(redirected.status, 1);
     assert.match(redirected.stderr, /anonymous provider opencode-free must use its fixed official endpoint/);
+
+    const redirectedResponses = load((registry) => {
+      registry.providers = registry.providers.map((provider) =>
+        provider.id === "opencode-free-responses"
+          ? { ...provider, baseUrl: "https://example.com/v1" }
+          : provider,
+      );
+    });
+    assert.equal(redirectedResponses.status, 1);
+    assert.match(
+      redirectedResponses.stderr,
+      /anonymous provider opencode-free-responses must use its fixed official endpoint/,
+    );
+
+    const invalidAllowlist = load((registry) => {
+      registry.providers = registry.providers.map((provider) =>
+        provider.id === "opencode-free-responses"
+          ? { ...provider, anonymousModels: [] }
+          : provider,
+      );
+    });
+    assert.equal(invalidAllowlist.status, 1);
+    assert.match(
+      invalidAllowlist.stderr,
+      /anonymous provider opencode-free-responses requires a valid anonymousModels allowlist/,
+    );
+
+    const wrongPolicy = load((registry) => {
+      registry.providers = registry.providers.map((provider) =>
+        provider.id === "opencode-free-responses"
+          ? { ...provider, anonymousModelPolicy: "opencode-console" }
+          : provider,
+      );
+    });
+    assert.equal(wrongPolicy.status, 1);
+    assert.match(
+      wrongPolicy.stderr,
+      /may declare anonymousModels only with explicit-models policy/,
+    );
+
+    const wrongResponseModel = load((registry) => {
+      registry.models.push({
+        slug: "opencode-free-responses/x-preview-f-free",
+        gatewayModel: "opencode-free-responses-x-preview-f-free",
+        upstreamModel: "x-preview-f-free",
+        provider: "opencode-free-responses",
+        listed: true,
+      });
+    });
+    assert.equal(wrongResponseModel.status, 1);
+    assert.match(
+      wrongResponseModel.stderr,
+      /anonymous provider opencode-free-responses only accepts its documented free-model ids/,
+    );
 
     const keyed = load((registry) => {
       registry.providers = registry.providers.map((provider) =>
@@ -1089,6 +1284,13 @@ test("local models route with Ollama's native protocol and a bounded context", (
   const rendered = renderLiteLlmConfig();
   const openAiRoutes = rendered.match(/model: "openai\/local-[^"]+"/g);
   assert.equal(openAiRoutes, null, "a local model must not use the OpenAI-compatible surface");
+  for (const block of rendered.matchAll(/model: "ollama_chat\/[^"]+"([\s\S]*?)(?=\n\s*- model_name:|\nlitellm_settings:)/g)) {
+    assert.match(
+      block[1],
+      /num_retries: 0/,
+      "a deterministic local rejection must not be repeated inside LiteLLM",
+    );
+  }
   // Every non-local model keeps the forwarder path untouched.
   assert.match(rendered, /model: "openai\/deepseek-v4-pro"/);
 });

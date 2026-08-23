@@ -28,6 +28,11 @@ import {
   resolveWriteTarget,
 } from "./file-security.mjs";
 import {
+  clearCodexRouterDefault,
+  readCodexRouterDefault,
+  writeCodexRouterDefault,
+} from "./codex-default-model.mjs";
+import {
   activateNativeCatalogSource,
   catalogPathsEqual,
   clearNativeCatalogSource,
@@ -949,6 +954,7 @@ function snapshot(contents) {
   const signedActive = signedState
     ? signedProviderStateIsOwned(contents, signedState)
     : false;
+  const routerDefault = readCodexRouterDefault();
   return {
     mode:
       isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH
@@ -966,10 +972,29 @@ function snapshot(contents) {
       signedActive && privateFileIsProtected(SIGNED_PROVIDER_MODE_PATH),
     ),
     signed_provider_state_present: existsSync(SIGNED_PROVIDER_MODE_PATH),
+    router_default_model: routerDefault?.model || null,
+    router_default_managed: Boolean(routerDefault),
     openai_base_url: baseUrl ? redactCallerUrl(baseUrl) : null,
     model_catalog_json: catalog || null,
     config_protected: privateFileIsProtected(CONFIG_PATH),
   };
+}
+
+function applyRouterDefault(contents, state = readCodexRouterDefault()) {
+  return state ? `${replaceRootValue(contents, "model", state.model)}\n` : contents;
+}
+
+// Restore only when the router still owns the exact value it installed. A
+// manual Codex edit wins over a later clear/disable rather than being erased.
+function restoreRouterDefault(contents, state = readCodexRouterDefault()) {
+  if (!state) return contents;
+  const { rootLines } = splitRoot(contents);
+  if (rootValue(rootLines, "model") !== state.model) return contents;
+  return `${replaceRootValue(
+    contents,
+    "model",
+    state.previousPresent ? state.previousModel : undefined,
+  )}\n`;
 }
 
 function enabledContents(contents) {
@@ -1112,9 +1137,11 @@ if (!new Set([
   "login-free-disable",
   "signed-enable",
   "signed-disable",
+  "router-default-set",
+  "router-default-clear",
 ]).has(command)) {
   console.error(
-    "Usage: config-manager.mjs enable|disable|status|login-free-enable|login-free-disable|signed-enable|signed-disable [--adopt-native-catalog]",
+    "Usage: config-manager.mjs enable|disable|status|login-free-enable|login-free-disable|signed-enable|signed-disable|router-default-set MODEL|router-default-clear [--adopt-native-catalog]",
   );
   process.exit(2);
 }
@@ -1130,6 +1157,8 @@ let pendingProviderModeState;
 let clearNativeCatalogSourceAfterWrite = false;
 let activateNativeCatalogSourceAfterWrite = false;
 let pendingSignedProviderModeState;
+let pendingRouterDefaultState;
+let clearRouterDefaultState = false;
 if (command === "enable") {
   const signedState = readSignedProviderModeState();
   if (signedState?.version === 1) {
@@ -1157,13 +1186,41 @@ if (command === "enable") {
   } else {
     next = enabledContents(current);
   }
+  next = applyRouterDefault(next);
   activateNativeCatalogSourceAfterWrite = nativeCatalogNeedsActivation;
+} else if (command === "router-default-set") {
+  const model = String(process.argv[3] || "").trim();
+  if (!model) throw new Error("Usage: config-manager.mjs router-default-set MODEL");
+  const currentSnapshot = snapshot(current);
+  if (currentSnapshot.login_free) {
+    throw new Error("The router default is for signed-in Codex; login-free mode already owns its default.");
+  }
+  if (currentSnapshot.mode !== "router") {
+    throw new Error("Enable Codex Router before setting a router default model.");
+  }
+  const existing = readCodexRouterDefault();
+  const { rootLines } = splitRoot(current);
+  const previousPresent = existing?.previousPresent ?? rootHasValue(rootLines, "model");
+  pendingRouterDefaultState = {
+    version: 1,
+    model,
+    previousPresent,
+    ...(previousPresent
+      ? { previousModel: existing?.previousModel ?? rootValue(rootLines, "model") }
+      : {}),
+  };
+  next = applyRouterDefault(current, pendingRouterDefaultState);
+} else if (command === "router-default-clear") {
+  next = restoreRouterDefault(current);
+  clearRouterDefaultState = Boolean(readCodexRouterDefault());
 } else if (command === "login-free-enable") {
   if (existsSync(SIGNED_PROVIDER_MODE_PATH)) {
     throw new Error("Turn off signed routing before enabling login-free mode.");
   }
-  const enabled = enabledContents(current);
-  const { rootLines } = splitRoot(current);
+  const defaultRestored = restoreRouterDefault(current);
+  clearRouterDefaultState = Boolean(readCodexRouterDefault());
+  const enabled = enabledContents(defaultRestored);
+  const { rootLines } = splitRoot(defaultRestored);
   const loginFreeModel = String(process.argv[3] || "").trim();
   const alreadyManaged =
     rootValue(rootLines, "model_provider") === routerProviderId &&
@@ -1220,6 +1277,7 @@ if (command === "enable") {
     pendingSignedProviderModeState = managed.state;
     next = managed.contents;
   }
+  next = applyRouterDefault(next);
 } else {
   const state = readProviderModeState();
   const signedState = readSignedProviderModeState();
@@ -1313,6 +1371,10 @@ if (command === "enable") {
       ].join("\n").trimEnd()}\n`;
     }
   }
+  if (["disable", "login-free-disable", "signed-disable"].includes(command)) {
+    next = restoreRouterDefault(next);
+    clearRouterDefaultState = Boolean(readCodexRouterDefault());
+  }
 }
 if (existsSync(CONFIG_PATH) && !existsSync(BACKUP_PATH)) {
   copyFileSync(CONFIG_PATH, BACKUP_PATH);
@@ -1321,8 +1383,12 @@ if (existsSync(BACKUP_PATH)) protectPrivateFile(BACKUP_PATH);
 const previousSignedProviderModeState = pendingSignedProviderModeState
   ? readSignedProviderModeState()
   : undefined;
+const previousRouterDefaultState = pendingRouterDefaultState
+  ? readCodexRouterDefault()
+  : undefined;
 if (pendingProviderModeState) writeProviderModeState(pendingProviderModeState);
 if (pendingSignedProviderModeState) writeSignedProviderModeState(pendingSignedProviderModeState);
+if (pendingRouterDefaultState) writeCodexRouterDefault(pendingRouterDefaultState);
 try {
   atomicWrite(next);
   if (activateNativeCatalogSourceAfterWrite) activateNativeCatalogSource();
@@ -1333,6 +1399,13 @@ try {
       writeSignedProviderModeState(previousSignedProviderModeState);
     } else {
       clearSignedProviderModeState();
+    }
+  }
+  if (pendingRouterDefaultState) {
+    if (previousRouterDefaultState) {
+      writeCodexRouterDefault(previousRouterDefaultState);
+    } else {
+      clearCodexRouterDefault();
     }
   }
   if (activateNativeCatalogSourceAfterWrite) {
@@ -1350,4 +1423,5 @@ try {
 if (command === "disable" || command === "login-free-disable") clearProviderModeState();
 if (clearNativeCatalogSourceAfterWrite) clearNativeCatalogSource();
 if (command === "disable" || command === "signed-disable") clearSignedProviderModeState();
+if (clearRouterDefaultState) clearCodexRouterDefault();
 process.stdout.write(`${JSON.stringify(snapshot(next))}\n`);

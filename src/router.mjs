@@ -25,13 +25,18 @@ import {
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
+  installGracefulShutdown,
   pipeResponse,
   readRequestBody,
+  writeEventStreamHead,
   writeJson,
   writeStreamErrorEvent,
 } from "./http-utils.mjs";
 import { EmptyCompletionGuard } from "./empty-completion-guard.mjs";
-import { zaiResponsesCompatTransform } from "./zai-responses-compat.mjs";
+import {
+  ZaiResponsesCompatTransform,
+  zaiResponsesCompatTransform,
+} from "./zai-responses-compat.mjs";
 import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
@@ -58,10 +63,14 @@ import {
 import { fetchWithRetry } from "./upstream-retry.mjs";
 import {
   NamespaceToolCallTransform,
+  agentMessagesAsUserMessages,
+  bridgeCustomTools,
+  downgradeOriginalImageDetail,
   flattenNamespacedHistory,
   flattenNamespaceTools,
   flattenToolSearchHistory,
   repairToolSchemaRoots,
+  stripSearchContentTypes,
 } from "./namespace-relay.mjs";
 import { collaborationToolAvailable, pendingInterruptTargets } from "./subagent-completion.mjs";
 import {
@@ -88,7 +97,8 @@ import {
   activityMetadataFromHeaders,
   threadIdFromHeaders,
 } from "./codex-session-names.mjs";
-import { translateGatewayError } from "./error-translation.mjs";
+import { gatewayErrorStatus, translateGatewayError } from "./error-translation.mjs";
+import { describeTransportFailure } from "./transport-failure.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import {
   classifySsePrefix,
@@ -116,7 +126,10 @@ import {
 } from "./tool-result-aging-state.mjs";
 import { VERSION } from "./version.mjs";
 import { nativeSessionHeaders } from "./codex-native-session.mjs";
-import { installStableFetchTransport } from "./fetch-transport.mjs";
+import {
+  installStableFetchTransport,
+  loopbackProbeFetch,
+} from "./fetch-transport.mjs";
 
 installStableFetchTransport();
 
@@ -305,6 +318,23 @@ function parseBody(buffer) {
     wrapped.status = 400;
     throw wrapped;
   }
+}
+
+// Large Codex turns parse several megabytes of JSON on the event loop. Yield
+// first so an already-accepted GET /health can answer instead of sitting
+// behind that parse and looking like a dead router to the tray.
+async function parseBodyAsync(buffer) {
+  await new Promise((resolve) => setImmediate(resolve));
+  return parseBody(buffer);
+}
+
+function bindClientAbort(request, response, onAbort) {
+  const abort = () => onAbort();
+  request.once("aborted", abort);
+  response.once("close", () => {
+    if (!response.writableEnded) abort();
+  });
+  if (request.aborted || response.destroyed) abort();
 }
 
 function decodeBody(body, contentEncoding) {
@@ -516,6 +546,24 @@ function normalizeAutoToolChoice(payload, route) {
   ) {
     payload.tool_choice = "auto";
   }
+}
+
+// The documented Zen Free pair has two different wire contracts: Ox uses Chat
+// Completions and Muse Contributor Free uses Responses. Their observed strict
+// tool/input limitations do not establish a contract for paid Zen, Go, or any
+// other free model, so keep this compatibility boundary exact.
+function needsZenFreeToolCompatibility(route) {
+  const providerId = providerForModel(route)?.id;
+  return (
+    (providerId === "opencode-free" && route.upstreamModel === "x-preview-f-free") ||
+    (providerId === "opencode-free-responses" &&
+      route.upstreamModel === "muse-spark-1.2-contributor-free")
+  );
+}
+
+function zenFreeCompatibleInput(input, route) {
+  if (!needsZenFreeToolCompatibility(route)) return input;
+  return downgradeOriginalImageDetail(agentMessagesAsUserMessages(input));
 }
 
 function nativeTarget(pathname, search = "") {
@@ -749,7 +797,7 @@ function catalogModels() {
 
 // Shared across every /health request so a polling companion collapses into
 // one probe per service per window instead of three per poll.
-const healthCache = createHealthCache();
+const healthCache = createHealthCache({ staleWhileRevalidate: true });
 
 function serviceHealth(url) {
   return healthCache(url, () => probeService(url));
@@ -757,7 +805,9 @@ function serviceHealth(url) {
 
 async function probeService(url) {
   try {
-    const response = await fetch(url, {
+    // No dispatcher argument: `loopbackProbeFetch` owns one shared probe pool
+    // for the process, so this cannot fork a second one.
+    const response = await loopbackProbeFetch(url, {
       headers: { Authorization: `Bearer ${INTERNAL_KEY}` },
       signal: AbortSignal.timeout(3_000),
     });
@@ -1148,6 +1198,42 @@ function visionEngineProvider(engine) {
 // refusal again.
 const visionReadsInFlight = new Map();
 
+// A provider can report account quota exhaustion without a trustworthy reset
+// header. Do not invent a provider cooldown in that case, but also do not buy
+// the exact same failed image read again on every rapid follow-up turn. This is
+// deliberately a short, per-read anti-storm backoff rather than a claim about
+// when the provider quota resets. Provider-named reset windows still use the
+// durable cooldown store below.
+const VISION_FAILURE_BACKOFF_MS = 60_000;
+const VISION_FAILURE_CACHE_MAX_ENTRIES = 128;
+const visionFailedReads = new Map();
+
+function visionFailureCacheKey(readKey) {
+  return createHash("sha256").update(readKey).digest("base64url");
+}
+
+function cachedVisionFailure(readKey, now = Date.now()) {
+  const cacheKey = visionFailureCacheKey(readKey);
+  const cached = visionFailedReads.get(cacheKey);
+  if (!cached) return undefined;
+  if (cached.expiresAt > now) return cached.error;
+  visionFailedReads.delete(cacheKey);
+  return undefined;
+}
+
+function rememberVisionFailure(readKey, error, now = Date.now()) {
+  // A reset-bearing 429 is handled by providerCooldown(), which is broader and
+  // more accurate. The negative cache exists only for quota exhaustion where
+  // the provider named no usable reset window.
+  if (error?.failureKind !== "out_of_usage" || error?.cooldownUntil) return;
+  const cacheKey = visionFailureCacheKey(readKey);
+  visionFailedReads.delete(cacheKey);
+  visionFailedReads.set(cacheKey, { error, expiresAt: now + VISION_FAILURE_BACKOFF_MS });
+  while (visionFailedReads.size > VISION_FAILURE_CACHE_MAX_ENTRIES) {
+    visionFailedReads.delete(visionFailedReads.keys().next().value);
+  }
+}
+
 // Codex resends the whole conversation every turn, so the same screenshot
 // arrives again on every follow-up. Without the hash cache a five-turn
 // conversation about one image would buy the same transcript five times.
@@ -1178,6 +1264,8 @@ async function visionEvidenceFor(url, engine, request, effort, question = "", re
   // record of spend, not of calls the router avoided.
   if (cached !== undefined) return cached;
   const readKey = `${key}\u0000${question}`;
+  const failed = cachedVisionFailure(readKey);
+  if (failed) throw failed;
   const running = visionReadsInFlight.get(readKey);
   if (running) return running;
   // Deliberately not tied to the caller's AbortSignal. The read is shared, so
@@ -1189,6 +1277,9 @@ async function visionEvidenceFor(url, engine, request, effort, question = "", re
   visionReadsInFlight.set(readKey, read);
   try {
     return await read;
+  } catch (error) {
+    rememberVisionFailure(readKey, error);
+    throw error;
   } finally {
     visionReadsInFlight.delete(readKey);
   }
@@ -1218,6 +1309,22 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
     });
     status = 200;
     return evidenceCache.set(key, question, text);
+  } catch (error) {
+    const errorStatus = Number(error?.status);
+    if (Number.isFinite(errorStatus)) status = errorStatus;
+    const reason =
+      error?.failureKind === "out_of_usage"
+        ? "out_of_usage"
+        : errorStatus === 429 && error?.cooldownUntil
+          ? "rate_limited"
+          : undefined;
+    if (reason && error?.cooldownUntil) {
+      recordProviderCooldown(visionEngineProvider(engine), {
+        until: error.cooldownUntil,
+        reason,
+      });
+    }
+    throw error;
   } finally {
     recordUsageEvent({
       model: engine.slug,
@@ -1395,12 +1502,26 @@ async function bridgeVisionInput(input, route, request) {
   }
   const { effort } = settings;
   let fellBack = 0;
+  // A quota exhaustion is account/provider-wide evidence, not a reason to walk
+  // every model slug backed by that same account. Keep this set scoped to the
+  // current bridge call when the provider did not name a reset window; that
+  // avoids duplicate spend without inventing how long the quota will stay
+  // empty. A provider-named window is persisted by readVisionEvidence instead.
+  const exhaustedProviders = new Set();
   // Each engine in turn until one reads the image. The first is the operator's
   // choice and answers nearly always; the rest exist so a lapsed session or a
   // provider outage costs a slower read rather than the whole image.
   const readWithAnyEngine = async (url, question) => {
     let lastError;
     for (const [index, engine] of engines.entries()) {
+      const provider = canonicalProviderId(visionEngineProvider(engine));
+      const cooled = providerCooldown(provider);
+      if (cooled || exhaustedProviders.has(provider)) {
+        lastError ??= new Error(
+          `${engine.displayName || engine.slug} is temporarily unavailable because its provider reported a quota or rate limit`,
+        );
+        continue;
+      }
       // Retry the engine only when there is nothing else to try. Waiting out a
       // 250ms + 1s ladder against an endpoint that is down, when a working
       // engine is sitting right behind it, is how a fallback that works turns
@@ -1420,6 +1541,7 @@ async function bridgeVisionInput(input, route, request) {
         return { text, engineName: engine.displayName || engine.slug };
       } catch (error) {
         lastError = error;
+        if (error?.failureKind === "out_of_usage") exhaustedProviders.add(provider);
       }
     }
     // Every engine refused, so the turn says what the last one said -- the
@@ -1621,7 +1743,15 @@ function compactionAttempts(route, aged) {
 // turn -- a compaction that fails ends the session just as hard, because the
 // conversation cannot get under its context limit without one.
 async function summarizeWith(request, payload, route, aged, signal) {
-  const bridged = await bridgeVisionInput(aged.input, route, request);
+  const compatibleInput = zenFreeCompatibleInput(aged.input, route);
+  const providerInput = needsZenFreeToolCompatibility(route)
+    ? bridgeCustomTools([], compatibleInput, new Map()).input
+    : compatibleInput;
+  const bridged = await bridgeVisionInput(
+    providerInput,
+    route,
+    request,
+  );
   const body = {
     ...payload,
     model: route.gatewayModel,
@@ -1762,11 +1892,7 @@ function writeCompactionSse(response, model, summary) {
     ["response.output_item.done", { output_index: 0, item }],
     ["response.completed", { response: completed }],
   ];
-  response.writeHead(200, {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
+  writeEventStreamHead(response);
   events.forEach(([type, data], sequence) => {
     response.write(
       `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence, ...data })}\n\n`,
@@ -1879,38 +2005,13 @@ function requireCodexTransport(request, response) {
   return true;
 }
 
-// A model in the experimental subagent window earns its durable proof — or
-// its demotion — from real traffic: Codex marks child turns with
-// x-openai-subagent, so the first clean completion of one settles "this model
-// can hold the child role" without a dedicated probe session. Structural
-// rejections demote (400/422, the shape a schema or encrypted-payload refusal
-// takes); transient failures — 429s, 5xx, disconnects — prove nothing either
-// way and leave the window open. No line here is QUIET-gated: a promotion or
-// demotion that happens silently is how a picker entry becomes unexplainable.
-//
-// What the promotion claims is exactly one HTTP turn, and the log line has to
-// say so. A child agent makes many turns — one per tool-call round trip — and
-// this observer sees each of them separately; it never sees the agent loop
-// that strings them together, so "the child reached done" is not a fact
-// available here. An operator who read the old "subagent proven … completed a
-// live child turn" as *the delegated work finished* was reading a promise the
-// router cannot make (issue #257).
-//
-// The two halves of that issue meet here, and both are about the gate rather
-// than the thresholds. The gate used to be `awaitingSpawnProof`, true only for
-// `experimental` — so the instant turn one promoted a slug this function
-// stopped looking at it, and a hard 400/422 on turn two was discarded along
-// with everything else. That made the *oldest* observation win over the
-// newest, which no comment ever argued for. The gate is now revocability, so a
-// slug keeps being watched for as long as this machine's traffic is what the
-// v2 advertisement rests on; promotion alone stays scoped to the experimental
-// window, because a first clean turn is only news once.
-//
-// Watching a `proven` slug is also what makes the convergence signal usable. A
-// looping child emits 200s forever, so no status-shaped branch could ever fire
-// for it; the evidence is instead how much of its own budget one spawn burns
-// without stopping, accounted per child thread in subagent-turns.mjs against
-// the model's declared auto-compact limit.
+// Older releases advertised a locally probed route as experimental and then
+// refined that record from `x-openai-subagent` traffic. Keep observing only
+// those historical experimental records so upgrades preserve useful evidence,
+// but never treat the result as catalog authority: local traffic can neither
+// promote nor demote the exact checked-in registry certificate. A 400/422 is
+// useful negative application evidence; transient failures prove nothing. A
+// clean 200 proves only one HTTP turn completed, not that a delegated task did.
 
 function observeSubagentOutcome(request, route, status, options = {}) {
   if (!route) return;
@@ -1923,8 +2024,8 @@ function observeSubagentOutcome(request, route, status, options = {}) {
       recordSpawnFailure(route.slug, { reason, ...detail });
       forgetChildSpawn(spawnId);
       console.error(
-        `[codex-router] subagent demoted: ${route.slug} ${reason}; ` +
-          "it stays v1 until 'control subagents verify' passes again",
+        `[codex-router] legacy subagent evidence rejected: ${route.slug} ${reason}; ` +
+          "the route still requires a reviewed repository v2 certificate",
       );
     };
     if (status === 400 || status === 422) {
@@ -1940,8 +2041,8 @@ function observeSubagentOutcome(request, route, status, options = {}) {
     if (awaitingSpawnProof(route.slug, proofs)) {
       recordSpawnObserved(route.slug, { status });
       console.error(
-        `[codex-router] subagent child role verified: ${route.slug} served a live child turn; ` +
-          "the model holds the child role on the wire, which is not a claim the child finished its task",
+        `[codex-router] legacy subagent evidence observed: ${route.slug} served one child HTTP turn; ` +
+          "this remains diagnostic and is not a repository v2 certificate",
       );
     }
     const spawn = observeChildTurn({
@@ -1993,7 +2094,11 @@ function observeSubagentOutcome(request, route, status, options = {}) {
 async function buildRoutedRequest({ request, payload, route, agedInput }) {
   let namespacesFlattened = false;
   let flattenedNamespaces = new Map();
-  const bridged = await bridgeVisionInput(agedInput, route, request);
+  const bridged = await bridgeVisionInput(
+    zenFreeCompatibleInput(agedInput, route),
+    route,
+    request,
+  );
   // `bridgeVisionInput` returns its argument unchanged when there is no image
   // to read, and `carryReasoningThroughInput` writes into the array it is
   // given -- so without this copy the first build would rewrite the shared
@@ -2068,7 +2173,26 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     // too, on the tools alone, without flattening anything.
     tools = repairToolSchemaRoots(tools);
   }
+  if (needsZenFreeToolCompatibility(route)) {
+    // Ox reaches Chat Completions after namespace flattening while Muse reaches
+    // Responses with native namespaces. Run the same recursive-ref repair
+    // after both protocol branches so neither wire shape can bypass it.
+    tools = repairToolSchemaRoots(tools, { nonRecursive: true });
+    tools = stripSearchContentTypes(tools);
+  }
   let routedInput = input;
+  let routedToolChoice = payload.tool_choice;
+  if (needsZenFreeToolCompatibility(route)) {
+    const customTools = bridgeCustomTools(
+      tools,
+      routedInput,
+      flattenedNamespaces,
+      routedToolChoice,
+    );
+    tools = customTools.tools;
+    routedInput = customTools.input;
+    routedToolChoice = customTools.toolChoice;
+  }
   if (chatCompletionsProvider) {
     const searchHistory = flattenToolSearchHistory(
       routedInput,
@@ -2089,6 +2213,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     model: route.gatewayModel,
     input: routedInput,
   };
+  if (routedToolChoice !== payload.tool_choice) routed.tool_choice = routedToolChoice;
   // Codex chooses a child's model; this is where an operator gets to choose its
   // depth. Applied only to turns Codex marked as a child, so a parent
   // conversation on the same model is untouched -- running one model
@@ -2133,9 +2258,12 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     flattenedNamespaces,
     // Close finished children the parent left Working. Only when the
     // collaboration toolset is actually available on this turn.
-    pendingInterrupts: pendingInterruptTargets(input, {
-      namespaces: flattenedNamespaces,
-    }),
+    pendingInterrupts: pendingInterruptTargets(
+      needsZenFreeToolCompatibility(route) ? agedInput : input,
+      {
+        namespaces: flattenedNamespaces,
+      },
+    ),
   };
 }
 
@@ -2308,11 +2436,16 @@ async function handleResponses(request, response, requestUrl) {
   let finalStatus;
   let activityStatus;
   let usageRecorded = false;
+  const controller = new AbortController();
+  bindClientAbort(request, response, () => {
+    clientGone = true;
+    controller.abort();
+  });
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
-    const payload = parseBody(body);
+    const payload = await parseBodyAsync(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
     let registeredRoute =
       MODEL_BY_SLUG.get(requestedModel) ??
@@ -2361,18 +2494,6 @@ async function handleResponses(request, response, requestUrl) {
       route &&
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
-
-    const controller = new AbortController();
-    request.once("aborted", () => {
-      clientGone = true;
-      controller.abort();
-    });
-    response.once("close", () => {
-      if (!response.writableEnded) {
-        clientGone = true;
-        controller.abort();
-      }
-    });
 
     if (route && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
@@ -2637,17 +2758,24 @@ async function handleResponses(request, response, requestUrl) {
       const provider = providerForModel(route);
       const retryAfterHeader = upstream.headers.get("retry-after");
       const retryAfterSeconds = Number(retryAfterHeader);
+      const translatedStatus = gatewayErrorStatus({
+        status: upstream.status,
+        bodyText: failedBodyText,
+      });
       if (retryAfterHeader) response.setHeader("Retry-After", retryAfterHeader);
       writeJson(
         response,
-        upstream.status,
+        translatedStatus,
         translateGatewayError({
           status: upstream.status,
           // Already drained above so the failover classifier could read it; a
           // second `.text()` on the same response yields "".
           bodyText: failedBodyText ?? (await upstream.text().catch(() => "")),
           modelName: route.displayName || route.slug,
-          providerName: provider?.ownedBy || provider?.displayName || route.provider,
+          providerName:
+            provider?.transport === "ollama"
+              ? "Ollama"
+              : provider?.ownedBy || provider?.displayName || route.provider,
           providerKind: provider?.kind,
           retryAfterSeconds: Number.isFinite(retryAfterSeconds)
             ? retryAfterSeconds
@@ -2663,8 +2791,8 @@ async function handleResponses(request, response, requestUrl) {
         firstTokenMs,
       });
       observeSubagentOutcome(request, route, upstream.status);
-      finalStatus = upstream.status;
-      activityStatus = upstream.status;
+      finalStatus = translatedStatus;
+      activityStatus = translatedStatus;
       usageRecorded = true;
       if (!QUIET) {
         console.error(
@@ -2693,10 +2821,20 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [usageObserver];
-      const zaiCompat = route
+      let envelopeCompat = route
         ? zaiResponsesCompatTransform(route.provider, contentType)
         : undefined;
-      if (zaiCompat) transforms.push(zaiCompat);
+      // LiteLLM's Ox Chat -> Responses bridge can start assistant text after
+      // reasoning without its message envelope. Keep that repair exact.
+      if (
+        !envelopeCompat &&
+        route?.provider === "opencode-free" &&
+        route.upstreamModel === "x-preview-f-free" &&
+        String(contentType).toLowerCase().includes("text/event-stream")
+      ) {
+        envelopeCompat = new ZaiResponsesCompatTransform();
+      }
+      if (envelopeCompat) transforms.push(envelopeCompat);
       // Restore flattened namespace calls for routed chat-completions providers,
       // and inject missing finished-child interrupts for both routed and native
       // multi-agent parents (San Francisco uses native GPT).
@@ -3072,6 +3210,11 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
   const activity = beginRequestActivity();
   let clientGone = false;
   let requestedModel = defaultModel;
+  const controller = new AbortController();
+  bindClientAbort(request, response, () => {
+    clientGone = true;
+    controller.abort();
+  });
   try {
     if (!requireCodexTransport(request, response)) return;
     // Image and web-search turns are native-only; an idle install refuses
@@ -3082,25 +3225,13 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     }
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
-    const payload = parseBody(body);
+    const payload = await parseBodyAsync(body);
     requestedModel =
       typeof payload.model === "string" ? payload.model : defaultModel;
     activity.setRoute({
       provider: "openai",
       model: requestedModel,
       ...activityMetadataFromHeaders(request.headers),
-    });
-
-    const controller = new AbortController();
-    request.once("aborted", () => {
-      clientGone = true;
-      controller.abort();
-    });
-    response.once("close", () => {
-      if (!response.writableEnded) {
-        clientGone = true;
-        controller.abort();
-      }
     });
 
     const headers = nativeHeaders(request);
@@ -3276,18 +3407,33 @@ const server = http.createServer((request, response) => {
     // `TypeError: fetch failed` with the socket-level code buried on its cause
     // (#171). The whole chain belongs in the log; response bodies never do.
     console.error(`[codex-router] request failed: ${formatErrorChain(error)}`);
+    // A socket-level failure is the one class of error whose cause is safe to
+    // state and useless to withhold: it names a host and a network condition,
+    // never a credential or an upstream body. Without it Codex reports only
+    // its own transport wording -- `stream disconnected before completion` --
+    // and an unreachable upstream is indistinguishable from a router bug.
+    const transport = describeTransportFailure(error);
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
           type: "local_router_error",
-          message: "The local router could not complete the request.",
+          code: transport?.code,
+          message: transport
+            ? `The local router could not complete the request: ${transport.cause}.${transport.hint}`
+            : "The local router could not complete the request.",
         },
       });
     } else {
       // The body is already streaming, so there is no status left to change.
       // Destroying here reset the socket and cost the chunked terminator,
-      // which the client reported only as a decode failure.
-      endStreamedResponse(response);
+      // which the client reported only as a decode failure. The event code
+      // stays `local_router_stream_failed`: a diagnosed cause is extra detail
+      // about the same failure, not a different one for a client to branch on.
+      endStreamedResponse(response, {
+        message: transport
+          ? `The local router lost the upstream response stream: ${transport.cause}.${transport.hint}`
+          : undefined,
+      });
     }
   });
 });
@@ -3346,6 +3492,4 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
-}
+installGracefulShutdown(server, { label: "codex-router" });

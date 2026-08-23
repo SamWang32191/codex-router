@@ -55,12 +55,17 @@ sequenceDiagram
 The split registry tree under `config/` supplies the model mapping used by the
 catalog, router, gateway generator, API forwarder, and doctor.
 
-`enabled-providers.json` is a separate local policy. It controls both picker
-visibility and dispatcher access. A known namespaced model whose provider is
-hidden receives a local `provider_not_enabled` error; it is never mistaken for a
-native model or forwarded with Codex authentication. The policy is read on each
-external request, so provider visibility can change without restarting the
-service (Codex itself still needs a restart to reload the picker catalog).
+`enabled-providers.json` is a separate local policy owned by the router plane.
+It controls routed picker visibility and dispatcher access. `model-picker.json`
+stores the durable per-model decision, including explicit show choices, and the
+Codex, DeepSeek Harness, and Gemini publishers all consume that same state for
+external models. In a signed-in Codex install, the native GPT catalog and its
+base-entry visibility remain Codex-owned, so a router "hide all" action cannot
+erase the original native picker. A known namespaced model whose provider is hidden receives a local
+`provider_not_enabled` error; it is never mistaken for a native model or
+forwarded with Codex authentication. The policy is read on each external
+request, so provider visibility can change without restarting the service
+(Codex itself still needs a restart to reload the picker catalog).
 Catalog generation also requires a stored credential or valid OAuth session for
 each enabled external provider. Native GPT entries are included only when
 `codex login status` confirms an OpenAI login, so signed-out login-free users see
@@ -185,8 +190,10 @@ history. The managed Codex provider table must also set
 field); older clients ignore the field and continue without standalone search.
 
 The checked-in registry currently enables this mode for DeepSeek V4 Flash on
-its direct API and opencode Go routes. Other provider/model pairs stay off
-until verified. User-model curation can opt in locally without changing the
+its direct API and opencode Go routes, DeepSeek V4 Flash Vision Exp, Xiaomi
+MiMo v2.5, and GLM-5.3 on the Z.ai Coding Plan. Other provider/model pairs
+stay off until verified -- including GLM-5.3 on the opencode Go relay, which
+is a different transport from the Z.ai route the capability was proven on. User-model curation can opt in locally without changing the
 shared registry.
 
 ## Transport and compaction

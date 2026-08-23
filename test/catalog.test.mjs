@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   AUTO_ANNOUNCE_WINDOW_MS,
@@ -16,10 +19,12 @@ import {
   buildLoginFreeCatalog,
   clampModelEfforts,
   codexEffortVocabulary,
+  effectivePickerHiddenModels,
   nativeCatalogIsReusable,
   deriveBaseInstructions,
   mergeNativeCatalogs,
   mergeNativeModel,
+  nativeSubagentCertification,
   promoteNativeMultiAgent,
   routedCatalogConfigured,
   routedModel,
@@ -57,6 +62,21 @@ const grok = {
   compHash: "grok-oauth-grok-4-5-v1",
   multiAgentVersion: "v2",
 };
+
+test("signed-in picker overlay cannot hide Codex native base entries", () => {
+  const hidden = new Set(["gpt-5.6-luna", "gpt-5.6-sol-1m", "grok-oauth/grok-4.5"]);
+  const native = new Set(["gpt-5.6-luna", "gpt-5.6-sol"]);
+  assert.deepEqual(
+    [...effectivePickerHiddenModels(hidden, native)].sort(),
+    ["gpt-5.6-sol-1m", "grok-oauth/grok-4.5"],
+  );
+  // Login-free aliases deliberately reuse native slugs, so the router policy
+  // applies to every entry in that mode.
+  assert.deepEqual(
+    [...effectivePickerHiddenModels(hidden, native, { loginFree: true })].sort(),
+    [...hidden].sort(),
+  );
+});
 
 test("routed catalog is exposed only when the active provider reaches the router", () => {
   // An absent base URL is the first-install case: setup has not written the
@@ -282,7 +302,7 @@ test("routed models advertise search and image detail only when the registry opt
 
 test("routed models can explicitly narrow inherited tool capabilities", () => {
   const plain = routedModel(template, grok);
-  assert.equal("supports_parallel_tool_calls" in plain, false);
+  assert.equal(plain.supports_parallel_tool_calls, false);
   assert.equal("experimental_supported_tools" in plain, false);
 
   const narrowed = routedModel(template, {
@@ -938,7 +958,7 @@ test("duplicate account slugs collapse to the first occurrence", () => {
   assert.equal(merged.models[0].visibility, "list");
 });
 
-test("native listed models follow the local subagent opt-in", () => {
+test("native listed models retain only repository-certified v2 capability", () => {
   // Upstream still ships gpt-5.6-luna as v1 while it runs fine on the v2
   // backend, and spawn_agent filters child models on that static value.
   const native = [
@@ -984,17 +1004,17 @@ test("native promotion honours disabled models and picker-hidden slugs", () => {
   assert.equal(promoted[1].multi_agent_version, "v1");
 });
 
-test("selected subagent mode only promotes the chosen native models", () => {
+test("selected subagent mode does not promote unreviewed native models", () => {
   const native = [
-    { slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" },
     { slug: "gpt-5.4", visibility: "list", multi_agent_version: "v1" },
+    { slug: "gpt-5.3", visibility: "list", multi_agent_version: "v1" },
   ];
   const promoted = promoteNativeMultiAgent(native, {
     mode: "selected",
-    enabled: ["gpt-5.6-luna"],
+    enabled: ["gpt-5.4"],
     disabled: [],
   });
-  assert.equal(promoted[0].multi_agent_version, "v2");
+  assert.equal(promoted[0].multi_agent_version, "v1");
   assert.equal(promoted[1].multi_agent_version, "v1");
 });
 
@@ -1017,6 +1037,7 @@ test("proven subagent mode still promotes upstream-verified v2-backend slugs", (
 
 test("an upstream-verified slug still honours disabled and picker-hidden", () => {
   const native = [{ slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" }];
+  assert.equal(nativeSubagentCertification(native[0]), "v2");
   const promoted = promoteNativeMultiAgent(
     native,
     { mode: "proven", enabled: [], disabled: ["gpt-5.6-luna"] },
@@ -1132,3 +1153,109 @@ test("efficient routed execution silently substitutes routine missing tools", ()
   assert.match(model.base_instructions, /optional helper.*unavailable.*switch silently/i);
   assert.match(model.base_instructions, /do not send.*progress message.*fallback/i);
 });
+
+// One whole catalog publication, from a `model-picker.json` in the shape a
+// build older than the allowlist left behind, to the file Codex reads at
+// startup. The unit tests above cover the state transition; this covers the
+// only thing the operator sees, which is whether the models are still in the
+// picker after an update (issue #338).
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function writeCatalogCodexStub(directory) {
+  const windows = process.platform === "win32";
+  const target = path.join(directory, windows ? "codex-picker.cmd" : "codex-picker");
+  const models = JSON.stringify({
+    models: [
+      { slug: "gpt-5.6-sol", display_name: "GPT-5.6 Sol", visibility: "list", priority: 10 },
+    ],
+  });
+  writeFileSync(
+    target,
+    windows
+      ? `@echo off\r\nif "%1"=="--version" (echo codex-cli 99.0.0& exit /b 0)\r\nif "%1"=="login" exit /b 0\r\nif "%1"=="debug" (echo ${models}& exit /b 0)\r\nexit /b 1\r\n`
+      : `#!/bin/sh
+case "$1" in
+  --version) echo 'codex-cli 99.0.0' ;;
+  login) exit 0 ;;
+  debug) printf '%s\\n' '${models}' ;;
+  *) exit 1 ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  return target;
+}
+
+test(
+  "an update publishes the models a pre-allowlist picker was already showing",
+  { timeout: 30_000 },
+  () => {
+    const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-picker-migration-"));
+    const stateDir = path.join(codexHome, "router-state");
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.6-sol"\n', {
+      mode: 0o600,
+    });
+    writeFileSync(
+      path.join(stateDir, "enabled-providers.json"),
+      `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-key\n", {
+      mode: 0o600,
+    });
+    // What the previous build wrote: the extended-window variant it seeded
+    // hidden, one model this operator switched off, and no `visible` key --
+    // so the two DeepSeek models absent from the file were the ones showing.
+    writeFileSync(
+      path.join(stateDir, "model-picker.json"),
+      `${JSON.stringify({
+        version: 1,
+        hidden: ["gpt-5.6-sol-1m", "deepseek/deepseek-v4-pro"],
+        seeded: ["gpt-5.6-sol-1m", "deepseek/deepseek-v4-pro"],
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    try {
+      const catalog = spawnSync(
+        process.execPath,
+        [path.join(repoRoot, "src", "catalog.mjs"), "--refresh-native"],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_BIN: writeCatalogCodexStub(codexHome),
+            CODEX_HOME: codexHome,
+            CODEX_ROUTER_STATE_DIR: stateDir,
+            MODEL_ROUTER_STATE_DIR: stateDir,
+            MODEL_ROUTER_TARGET: "codex",
+          },
+        },
+      );
+      assert.equal(catalog.status, 0, catalog.stderr);
+
+      const merged = JSON.parse(
+        readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
+      );
+      const visibility = new Map(
+        merged.models.map((model) => [String(model.slug), model.visibility]),
+      );
+      assert.equal(visibility.get("deepseek/deepseek-v4-flash"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
+      assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
+      assert.equal(visibility.get("gpt-5.6-sol-1m"), "hide");
+
+      const picker = JSON.parse(
+        readFileSync(path.join(stateDir, "model-picker.json"), "utf8"),
+      );
+      assert.deepEqual(picker.visible, [
+        "deepseek/deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-vision-exp",
+      ]);
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  },
+);

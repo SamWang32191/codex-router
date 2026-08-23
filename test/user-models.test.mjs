@@ -36,6 +36,17 @@ test("userModelEntry fills conservative picker metadata", () => {
   assert.ok(entry.description.length > 0);
 });
 
+test("OpenCode's opaque free preview id is presented as Ox Alpha Free", () => {
+  const entry = userModelEntry({
+    providerId: "opencode-free",
+    upstreamId: "x-preview-f-free",
+    priority: 100,
+  });
+  assert.equal(entry.slug, "opencode-free/x-preview-f-free");
+  assert.equal(entry.upstreamModel, "x-preview-f-free");
+  assert.equal(entry.displayName, "Ox Alpha Free");
+});
+
 test("curation metadata can set sizing and the effort ladder", () => {
   const entry = userModelEntry({
     providerId: "deepseek",
@@ -53,6 +64,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
       defaultEffort: "medium",
       serviceTiers: [{ id: "priority", name: "Fast" }],
       requiresTrailingUserTurn: true,
+      isFree: true,
     },
   });
   assert.equal(entry.contextWindow, 262144);
@@ -61,6 +73,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
   assert.equal(entry.defaultEffort, "medium");
   assert.deepEqual(entry.serviceTiers, [{ id: "priority", name: "Fast" }]);
   assert.equal(entry.requiresTrailingUserTurn, true);
+  assert.equal(entry.isFree, true);
 });
 
 test("curation metadata can expose provider-verified reasoning summaries", () => {
@@ -161,6 +174,12 @@ test("registry merges valid user models and skips collisions", async () => {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-trailing-turn", priority: 111 }),
       requiresTrailingUserTurn: "yes",
     },
+    // Local state is not a repository certificate. A hand-edited overlay must
+    // never make its own route appear as a native v2 subagent.
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-self-certified", priority: 112 }),
+      multiAgentVersion: "v2",
+    },
     // Reasoning-summary capability fields must agree. A valid enum on its own
     // must not make the catalog claim summaries for a model that does not
     // explicitly support them.
@@ -196,6 +215,7 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(slugs.includes("deepseek/deepseek-standalone-search"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-detail"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-trailing-turn"));
+  assert.ok(!slugs.includes("deepseek/deepseek-self-certified"));
   assert.ok(!slugs.includes("deepseek/deepseek-summary-without-support"));
   assert.ok(!slugs.includes("deepseek/deepseek-invalid-summary-support"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-upgrade"));
@@ -205,6 +225,7 @@ test("registry merges valid user models and skips collisions", async () => {
   );
   assert.ok(registry.MODEL_BY_GATEWAY_ID.has("deepseek-deepseek-user-test"));
   assert.ok(registry.USER_MODEL_WARNINGS.length >= 4);
+  assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => /may not declare multiAgentVersion v2/.test(warning)));
   const merged = registry.MODEL_BY_SLUG.get("deepseek/deepseek-user-test");
   assert.equal(merged.listed, true);
   assert.equal(merged.availabilityNux, "Now available through your DeepSeek key.");

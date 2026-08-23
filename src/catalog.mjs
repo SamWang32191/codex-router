@@ -30,7 +30,12 @@ import {
   readMultiAgentSettings,
   subagentEligibleModels,
 } from "./multi-agent-state.mjs";
-import { readHiddenModels, seedModelsHidden } from "./model-picker-state.mjs";
+import {
+  migrateLegacyVisibleModels,
+  modelPickerSnapshot,
+  readHiddenModels,
+  seedModelsHidden,
+} from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
 import {
   NATIVE_CONTEXT_VARIANT_SLUGS,
@@ -496,12 +501,14 @@ function normalizeNativeModel(model) {
   const supportsParallelToolCalls =
     typeof model.supports_parallel_tool_calls === "boolean"
       ? model.supports_parallel_tool_calls
-      : NATIVE_PARALLEL_TOOL_CALL_COMPAT.get(String(model.slug));
+      : NATIVE_PARALLEL_TOOL_CALL_COMPAT.get(String(model.slug)) ?? false;
   return {
     ...model,
-    ...(typeof supportsParallelToolCalls === "boolean"
-      ? { supports_parallel_tool_calls: supportsParallelToolCalls }
-      : {}),
+    // Recent Codex clients require this field on every catalog entry. An
+    // absent native declaration is not evidence that parallel calls work, so
+    // make the conservative answer explicit instead of leaving the catalog
+    // unparsable.
+    supports_parallel_tool_calls: supportsParallelToolCalls,
     supports_reasoning_summaries:
       typeof model.supports_reasoning_summaries === "boolean"
         ? model.supports_reasoning_summaries
@@ -589,6 +596,10 @@ export function routedModel(template, model, behaviorTemplate = template) {
     // absent declaration remains the conservative default.
     supports_search_tool: ["hosted", "standalone"].includes(model.searchTool?.mode),
     supports_image_detail_original: model.supportsImageDetailOriginal === true,
+    // A routed model must never inherit a native template's capability. Codex
+    // now requires the key, and `false` is both schema-valid and conservative
+    // until this exact provider/model route declares support.
+    supports_parallel_tool_calls: model.supportsParallelToolCalls === true,
     use_responses_lite: false,
     // Codex only knows one ApplyPatchToolType variant. The native template
     // carries "freeform", but upstreams that reject OpenAI custom tools (Meta
@@ -612,9 +623,6 @@ export function routedModel(template, model, behaviorTemplate = template) {
   // A few OpenAI-compatible upstreams reject tool scheduling the native
   // template advertises. Registry entries opt out explicitly so the picker
   // never offers a custom or parallel tool the provider backend will 400.
-  if (typeof model.supportsParallelToolCalls === "boolean") {
-    next.supports_parallel_tool_calls = model.supportsParallelToolCalls;
-  }
   if (Array.isArray(model.experimentalSupportedTools)) {
     next.experimental_supported_tools = [...model.experimentalSupportedTools];
   }
@@ -725,17 +733,24 @@ function sortCatalogModels(models) {
   });
 }
 
-// Native entries carry upstream's static multi_agent_version, and upstream
-// still ships gpt-5.6-luna as "v1" even though it runs correctly on the v2
-// backend (openai/codex#35097, #36294). spawn_agent filters candidate child
-// models on that static value, so a v1 entry can never be delegated to by a v2
-// parent.
-//
-// These upstream-verified slugs run fine on the v2 backend, so they are
-// promoted unconditionally — no mode switch, no Settings dance. The subagent
-// opt-in below only reaches the *remaining* native models, which stay
-// conservative because their v2 relay paths have not been verified.
+// Native entries carry upstream's static multi_agent_version. One pinned
+// backend exception is maintained in the repository after upstream evidence;
+// local selection or a stream/tool probe must never promote any other v1
+// model. That avoids turning a UI toggle into an unreviewed v2 assertion.
 const NATIVE_V2_BACKEND_SLUGS = new Set(["gpt-5.6-luna"]);
+
+// Keep the repository/upstream verdict separate from the effective catalog
+// value. Hiding or disabling a certified native route correctly publishes it
+// as v1, but that opt-out must not erase the certificate the control surfaces
+// need in order to let the operator turn it back on.
+export function nativeSubagentCertification(model) {
+  const slug = String(model?.slug || "");
+  if (NATIVE_CONTEXT_VARIANT_SLUGS.includes(slug)) return "v1";
+  if (NATIVE_V2_BACKEND_SLUGS.has(slug)) return "v2";
+  return model?.multi_agent_version === "v2" || model?.multi_agent_version === "v1"
+    ? model.multi_agent_version
+    : undefined;
+}
 
 export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
   const enabled = new Set(settings.enabled || []);
@@ -749,13 +764,16 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
       return { ...model, multi_agent_version: "v1" };
     }
     if (model.visibility !== "list") return model;
-    if (hidden.has(slug) || disabled.has(slug)) return model;
-    if (NATIVE_V2_BACKEND_SLUGS.has(slug)) {
+    if (hidden.has(slug) || disabled.has(slug)) {
+      return { ...model, multi_agent_version: "v1" };
+    }
+    if (nativeSubagentCertification(model) === "v2") {
       return { ...model, multi_agent_version: "v2" };
     }
-    if (settings.mode === "all" || (settings.mode === "selected" && enabled.has(slug))) {
-      return { ...model, multi_agent_version: "v2" };
-    }
+    // Deliberately do not use `mode` / `enabled` to promote a native model.
+    // Settings may opt an existing certificate out, not create one.
+    void enabled;
+    void settings;
     return model;
   });
 }
@@ -824,24 +842,54 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
   return { models: sortCatalogModels(models), aliases };
 }
 
+// A signed-in Codex catalog contains two policy domains: the account's native
+// entries and the router's routed entries. Keep the router overlay off native
+// base slugs so stale external picker state cannot erase Codex's original
+// picker. Login-free mode deliberately aliases external models onto those
+// slugs, so it is the one mode where the overlay applies to all entries.
+export function effectivePickerHiddenModels(hiddenModels, nativeBaseSlugs, { loginFree = false } = {}) {
+  const hidden = new Set([...hiddenModels || []].map((slug) => String(slug)));
+  if (loginFree) return hidden;
+  const native = new Set([...nativeBaseSlugs || []].map((slug) => String(slug)));
+  return new Set([...hidden].filter((slug) => !native.has(slug)));
+}
+
 function main() {
   // The catalog is what Codex offers in its picker. Writing it from a checkout
   // that does not own this state directory is how the picker ends up
   // advertising models the running gateway has no route for.
   assertStateOwnership("write the Codex model catalog");
   const userSlugs = new Set(readUserModels().map((model) => String(model.slug)));
-  // Before the hidden set is read, not after: an extended-window variant costs
-  // more per turn than the model it shadows, so it arrives switched off and
-  // stays off until the operator says otherwise. Only slugs with no recorded
-  // decision are touched, so this cannot undo a choice already made.
-  seedModelsHidden(NATIVE_CONTEXT_VARIANT_SLUGS);
-  const hiddenModels = readHiddenModels();
   const selectedModels = selectedConfiguredListedModels();
+  const loginFree = loginFreeConfigured();
+  // Before the picker state is read, not after: new router models are opt-in
+  // in a normal signed-in Codex install.  Curation or a picker "show" action
+  // records the positive selection; simply enabling a provider or updating a
+  // catalog must not make every one of its models appear.  The same one-time
+  // seeding also keeps extended-window variants off because they cost more per
+  // turn than the base model they shadow.  Login-free mode is different: its
+  // native-looking slots are router aliases and retain the existing behavior.
+  // Only slugs with no recorded decision are touched, so no later rebuild can
+  // undo an operator's choice.
+  const routedSeedSlugs = loginFree ? [] : selectedModels.map((model) => String(model.slug));
+  // First, though: an install that predates the allowlist recorded only what
+  // was switched off, so its routed models are absent from `seeded` and the
+  // opt-in default below would read "visible, never written down" as "never
+  // decided" and empty the picker on the first rebuild after an update
+  // (issue #338). This writes the old answer down once, for those slugs only,
+  // and is a no-op on a fresh install and on every later rebuild.  Native
+  // context variants are deliberately not offered to it: they have never been
+  // visible by default under either set of semantics.
+  migrateLegacyVisibleModels(routedSeedSlugs);
+  seedModelsHidden([...NATIVE_CONTEXT_VARIANT_SLUGS, ...routedSeedSlugs]);
+  const hiddenModels = readHiddenModels();
+  const pickerState = modelPickerSnapshot();
+  const visibleModels = new Set(pickerState.visible);
   const multiAgentSettings = readMultiAgentSettings();
-  // Demotions first, then this machine's own recorded proofs. Settings still
-  // never manufacture a v2 claim — a promotion here traces to a live probe
-  // or an observed spawn in `multi-agent-proofs.json` — and a slug the
-  // operator hid or switched off stays v1 whatever evidence it carries.
+  // Settings can disable a certified route, but machine-local proof records
+  // are diagnostic only: neither a compatibility probe nor an observed child
+  // turn may manufacture a v2 claim. That capability belongs to the exact
+  // checked-in registry route and its reviewed v2_agent application.
   const allMultiAgentModels = applyMultiAgentCapabilities(
     selectedModels,
     multiAgentSettings,
@@ -857,7 +905,18 @@ function main() {
     Date.now(),
   );
   const captured = nativeCatalog();
-  const loginFree = loginFreeConfigured();
+  // The router picker overlay is for routed models.  In a normal signed-in
+  // Codex install the account's native entries remain Codex-owned; applying a
+  // stale router `hidden` decision to them can erase the original Codex picker
+  // (for example after a previous "hide all" action).  Login-free mode is the
+  // exception: its native slugs are deliberately aliases for routed models,
+  // so the overlay remains authoritative there.
+  const nativeBaseSlugs = new Set(captured.models.map((model) => String(model.slug || "")));
+  const effectiveHiddenModels = effectivePickerHiddenModels(
+    hiddenModels,
+    nativeBaseSlugs,
+    { loginFree },
+  );
   const native = {
     ...captured,
     // Variants join before the multi-agent pass so the extended-context alias
@@ -866,7 +925,7 @@ function main() {
     models: promoteNativeMultiAgent(
       withNativeContextVariants(captured.models, { enabled: !loginFree }),
       multiAgentSettings,
-      hiddenModels,
+      effectiveHiddenModels,
     ),
   };
   // Dropping every native model is destructive, so only do it when Codex
@@ -899,7 +958,7 @@ function main() {
   // the verdict back out of.
   const nativeEngines = nativeVisionEngines({
     models: captured.models,
-    hidden: hiddenModels,
+    hidden: effectiveHiddenModels,
     authorized: openaiAuthenticated && !loginFree,
   });
   const visionEngine = resolveVisionEngine(
@@ -924,11 +983,26 @@ function main() {
     atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
     writeAnnouncedAt(announcedAt);
     atomicJson(MERGED_CATALOG_PATH, {
-      models: merged.map((model) =>
-        hiddenModels.has(String(model.slug))
+      models: merged.map((model) => {
+        const slug = String(model.slug);
+        // In login-free mode a native-looking slot is an alias for a routed
+        // model, so visibility follows the canonical routed slug that the
+        // operator selected. Normal signed-in native base entries remain
+        // client-owned and are never removed by router picker state.
+        const policySlug = aliases[slug] || slug;
+        const routerManaged = loginFree || !nativeBaseSlugs.has(slug);
+        const hidden = effectiveHiddenModels.has(policySlug);
+        // A state file written by the new picker carries positive selections.
+        // Older installs had only `hidden`; preserve their behavior until an
+        // operator makes a picker change, at which point the write records the
+        // explicit allowlist permanently.
+        const selected = pickerState.hasExplicitVisibility
+          ? visibleModels.has(policySlug)
+          : !hidden;
+        return routerManaged && (hidden || !selected)
           ? { ...model, visibility: "hide" }
-          : model,
-      ),
+          : model;
+      }),
     });
     if (process.env.MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE === "1") {
       throw new Error("Forced failure after model catalog publication.");
